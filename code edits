@@ -1,26 +1,791 @@
+import duckdb
 import json
+import os
+from pathlib import Path
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+def create_robust_fhir_tables(conn, ndjson_file='fhir_resources.ndjson'):
+    """Create FHIR tables with robust error handling for inconsistent data"""
+    
+    # Drop existing tables first
+    tables = ['patients', 'observations', 'encounters', 'conditions', 'medication_requests', 'procedures']
+    for table in tables:
+        try:
+            conn.execute(f"DROP TABLE IF EXISTS {table}")
+        except:
+            pass
+    
+    print("Creating FHIR tables with robust error handling...")
+    
+    # Use ignore_errors=true and union_by_name=true to handle inconsistencies
+    base_read_options = f"""
+        read_ndjson('{ndjson_file}', 
+                   auto_detect=true, 
+                   ignore_errors=true, 
+                   union_by_name=true,
+                   sample_size=50000)
+    """
+    
+    # Patients table - handle inconsistent name/address structures
+    try:
+        conn.execute(f"""
+            CREATE TABLE patients AS
+            SELECT 
+                id,
+                _source_file as source_file,
+                gender,
+                birthDate as birth_date,
+                -- Handle name field variations (could be array or object)
+                CASE 
+                    WHEN name IS NOT NULL THEN
+                        CASE 
+                            WHEN typeof(name) = 'JSON[]' AND len(name) > 0 THEN json_extract_string(name[1], '$.family')
+                            WHEN typeof(name) = 'JSON' THEN json_extract_string(name, '$.family')
+                            ELSE NULL
+                        END
+                    ELSE NULL 
+                END as family_name,
+                CASE 
+                    WHEN name IS NOT NULL THEN
+                        CASE 
+                            WHEN typeof(name) = 'JSON[]' AND len(name) > 0 THEN json_extract(name[1], '$.given')
+                            WHEN typeof(name) = 'JSON' THEN json_extract(name, '$.given')
+                            ELSE NULL
+                        END
+                    ELSE NULL 
+                END as given_names,
+                -- Store complex fields as JSON
+                name as name_full,
+                telecom,
+                address,
+                maritalStatus as marital_status,
+                current_timestamp as created_at
+            FROM {base_read_options}
+            WHERE resourceType = 'Patient'
+        """)
+        
+        count = conn.execute("SELECT COUNT(*) FROM patients").fetchone()[0]
+        print(f"✓ Patients: {count} records")
+        
+    except Exception as e:
+        print(f"✗ Error creating patients table: {e}")
+    
+    # Observations table
+    try:
+        conn.execute(f"""
+            CREATE TABLE observations AS
+            SELECT 
+                id,
+                _source_file as source_file,
+                status,
+                -- Handle category variations
+                CASE 
+                    WHEN category IS NOT NULL THEN
+                        CASE 
+                            WHEN typeof(category) = 'JSON[]' AND len(category) > 0 THEN json_extract_string(category[1], '$.coding[0].code')
+                            WHEN typeof(category) = 'JSON' THEN json_extract_string(category, '$.coding[0].code')
+                            ELSE NULL
+                        END
+                    ELSE NULL 
+                END as category,
+                json_extract_string(code, '$.coding[0].code') as code,
+                json_extract_string(code, '$.coding[0].display') as code_display,
+                json_extract_string(subject, '$.reference') as subject_reference,
+                json_extract_string(encounter, '$.reference') as encounter_reference,
+                effectiveDateTime as effective_datetime,
+                issued,
+                -- Handle different value types
+                CASE 
+                    WHEN valueQuantity IS NOT NULL THEN json_extract(valueQuantity, '$.value')
+                    ELSE NULL 
+                END as value_quantity_value,
+                CASE 
+                    WHEN valueQuantity IS NOT NULL THEN json_extract_string(valueQuantity, '$.unit')
+                    ELSE NULL 
+                END as value_quantity_unit,
+                valueString as value_string,
+                valueCodeableConcept,
+                component,
+                current_timestamp as created_at
+            FROM {base_read_options}
+            WHERE resourceType = 'Observation'
+        """)
+        
+        count = conn.execute("SELECT COUNT(*) FROM observations").fetchone()[0]
+        print(f"✓ Observations: {count} records")
+        
+    except Exception as e:
+        print(f"✗ Error creating observations table: {e}")
+    
+    # Encounters table (this one worked before)
+    try:
+        conn.execute(f"""
+            CREATE TABLE encounters AS
+            SELECT 
+                id,
+                _source_file as source_file,
+                status,
+                json_extract_string(class, '$.code') as class,
+                -- Handle type variations
+                CASE 
+                    WHEN type IS NOT NULL THEN
+                        CASE 
+                            WHEN typeof(type) = 'JSON[]' AND len(type) > 0 THEN json_extract_string(type[1], '$.coding[0].code')
+                            WHEN typeof(type) = 'JSON' THEN json_extract_string(type, '$.coding[0].code')
+                            ELSE NULL
+                        END
+                    ELSE NULL 
+                END as type,
+                json_extract_string(subject, '$.reference') as subject_reference,
+                participant,
+                json_extract_string(period, '$.start') as period_start,
+                json_extract_string(period, '$.end') as period_end,
+                reasonCode,
+                hospitalization,
+                location,
+                json_extract_string(serviceProvider, '$.reference') as service_provider,
+                current_timestamp as created_at
+            FROM {base_read_options}
+            WHERE resourceType = 'Encounter'
+        """)
+        
+        count = conn.execute("SELECT COUNT(*) FROM encounters").fetchone()[0]
+        print(f"✓ Encounters: {count} records")
+        
+    except Exception as e:
+        print(f"✗ Error creating encounters table: {e}")
+    
+    # Conditions table
+    try:
+        conn.execute(f"""
+            CREATE TABLE conditions AS
+            SELECT 
+                id,
+                _source_file as source_file,
+                json_extract_string(clinicalStatus, '$.coding[0].code') as clinical_status,
+                json_extract_string(verificationStatus, '$.coding[0].code') as verification_status,
+                -- Handle category variations
+                CASE 
+                    WHEN category IS NOT NULL THEN
+                        CASE 
+                            WHEN typeof(category) = 'JSON[]' AND len(category) > 0 THEN json_extract_string(category[1], '$.coding[0].code')
+                            WHEN typeof(category) = 'JSON' THEN json_extract_string(category, '$.coding[0].code')
+                            ELSE NULL
+                        END
+                    ELSE NULL 
+                END as category,
+                json_extract_string(code, '$.coding[0].code') as code,
+                json_extract_string(code, '$.coding[0].display') as code_display,
+                json_extract_string(subject, '$.reference') as subject_reference,
+                json_extract_string(encounter, '$.reference') as encounter_reference,
+                onsetDateTime as onset_datetime,
+                abatementDateTime as abatement_datetime,
+                recordedDate as recorded_date,
+                current_timestamp as created_at
+            FROM {base_read_options}
+            WHERE resourceType = 'Condition'
+        """)
+        
+        count = conn.execute("SELECT COUNT(*) FROM conditions").fetchone()[0]
+        print(f"✓ Conditions: {count} records")
+        
+    except Exception as e:
+        print(f"✗ Error creating conditions table: {e}")
+    
+    # MedicationRequest table (this one worked before)
+    try:
+        conn.execute(f"""
+            CREATE TABLE medication_requests AS
+            SELECT 
+                id,
+                _source_file as source_file,
+                status,
+                intent,
+                json_extract_string(medicationReference, '$.reference') as medication_reference,
+                json_extract_string(medicationCodeableConcept, '$.coding[0].code') as medication_code,
+                json_extract_string(medicationCodeableConcept, '$.coding[0].display') as medication_display,
+                json_extract_string(subject, '$.reference') as subject_reference,
+                json_extract_string(encounter, '$.reference') as encounter_reference,
+                authoredOn as authored_on,
+                json_extract_string(requester, '$.reference') as requester_reference,
+                dosageInstruction,
+                current_timestamp as created_at
+            FROM {base_read_options}
+            WHERE resourceType = 'MedicationRequest'
+        """)
+        
+        count = conn.execute("SELECT COUNT(*) FROM medication_requests").fetchone()[0]
+        print(f"✓ MedicationRequests: {count} records")
+        
+    except Exception as e:
+        print(f"✗ Error creating medication_requests table: {e}")
+    
+    # Procedures table
+    try:
+        conn.execute(f"""
+            CREATE TABLE procedures AS
+            SELECT 
+                id,
+                _source_file as source_file,
+                status,
+                json_extract_string(code, '$.coding[0].code') as code,
+                json_extract_string(code, '$.coding[0].display') as code_display,
+                json_extract_string(subject, '$.reference') as subject_reference,
+                json_extract_string(encounter, '$.reference') as encounter_reference,
+                json_extract_string(performedPeriod, '$.start') as performed_period_start,
+                json_extract_string(performedPeriod, '$.end') as performed_period_end,
+                performer,
+                reasonReference,
+                current_timestamp as created_at
+            FROM {base_read_options}
+            WHERE resourceType = 'Procedure'
+        """)
+        
+        count = conn.execute("SELECT COUNT(*) FROM procedures").fetchone()[0]
+        print(f"✓ Procedures: {count} records")
+        
+    except Exception as e:
+        print(f"✗ Error creating procedures table: {e}")
+
+def run_robust_extraction(json_dir=None, db_path='fhir_database.duckdb', ndjson_file='fhir_resources.ndjson'):
+    """Run the robust FHIR extraction"""
+    
+    # Step 1: Check if NDJSON exists
+    if not Path(ndjson_file).exists():
+        if json_dir:
+            logger.info("Converting JSON files to NDJSON...")
+            convert_to_ndjson(json_dir, ndjson_file)
+        else:
+            print(f"Error: {ndjson_file} not found and no json_dir specified")
+            return
+    else:
+        logger.info(f"Using existing NDJSON file: {ndjson_file}")
+    
+    # Step 2: Connect to DuckDB
+    conn = duckdb.connect(db_path)
+    
+    # Step 3: Create tables with robust handling
+    logger.info("Creating FHIR tables with robust error handling...")
+    create_robust_fhir_tables(conn, ndjson_file)
+    
+    # Step 4: Show final statistics
+    print("\n=== Final Database Statistics ===")
+    tables = ['patients', 'observations', 'encounters', 'conditions', 'medication_requests', 'procedures']
+    
+    total_records = 0
+    for table in tables:
+        try:
+            result = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
+            count = result[0]
+            total_records += count
+            print(f"{table}: {count:,} records")
+        except Exception as e:
+            print(f"{table}: Table not created - {e}")
+    
+    print(f"\nTotal extracted records: {total_records:,}")
+    
+    # Step 5: Show sample data from successful tables
+    print("\n=== Sample Data ===")
+    
+    for table in tables:
+        try:
+            # Check if table exists and has data
+            count_result = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
+            if count_result[0] > 0:
+                print(f"\n{table.upper()}:")
+                result = conn.execute(f"SELECT * FROM {table} LIMIT 2").fetchall()
+                columns = [desc[0] for desc in conn.description]
+                for i, row in enumerate(result):
+                    print(f"  Record {i+1}:")
+                    for col, val in zip(columns, row):
+                        if val is not None and str(val) != 'None':
+                            val_str = str(val)[:100] if len(str(val)) > 100 else str(val)
+                            print(f"    {col}: {val_str}")
+        except Exception as e:
+            continue
+    
+    # Step 6: Show useful queries
+    print("\n=== Example Queries You Can Run ===")
+    print("import duckdb")
+    print("conn = duckdb.connect('fhir_database.duckdb')")
+    print()
+    
+    # Show working table queries
+    working_tables = []
+    for table in tables:
+        try:
+            conn.execute(f"SELECT COUNT(*) FROM {table}")
+            working_tables.append(table)
+        except:
+            continue
+    
+    if 'patients' in working_tables:
+        print("# Get patient demographics:")
+        demographics = conn.execute('SELECT name_full, gender, birth_date FROM patients LIMIT 10').fetchall()
+        print(demographics)
+    
+    if 'observations' in working_tables:
+        print("\n# Get observation types:")
+        observation = conn.execute('SELECT code_display, COUNT(*) FROM observations GROUP BY code_display ORDER BY COUNT(*) DESC LIMIT 10').fetchall()
+        print(observation)
+    
+    if 'patients' in working_tables and 'conditions' in working_tables:
+        print("\n# Join patients with conditions:")
+        print("conn.execute('''SELECT p.family_name, c.code_display FROM patients p JOIN conditions c ON c.subject_reference = 'Patient/' || p.id LIMIT 10''').fetchall()")
+    
+    conn.close()
+    logger.info(f"Database saved to {db_path}")
+
+# Run the robust extraction
+if __name__ == "__main__":
+    # Run with existing NDJSON file
+    run_robust_extraction()
+
+# FHIR Data Cleaning Script for Spyder
+
+import duckdb
 import pandas as pd
+from datetime import datetime, date
 import matplotlib.pyplot as plt
 import seaborn as sns
-from datetime import datetime
-import os
-import warnings
-warnings.filterwarnings('ignore')
 
-def load_fhir_files(): # loading the FHIR files from specific file path, and storing them under json files
-    bundles = []
-    data_dir = 'downloads/fhir'  # or wherever you extracted files
-    for filename in os.listdir(data_dir):
-        filepath = os.path.join(data_dir, filename)
-        with open(filepath, 'r') as f:
-            data = json.load(f)
-            bundles.append(data)
-    return bundles
+# =============================================================================
+# 1. CONNECT TO DATABASE
+# =============================================================================
+# Update this path to your database location
+db_path = 'fhir_database.duckdb'
+conn = duckdb.connect(db_path)
 
-def extract_fhir_files(bundles):
-    resources = {
-        'Patient': []
-        'Observation': []
-        '
-            
-    }
+print("✅ Connected to FHIR database")
+
+# =============================================================================
+# 2. ASSESS DATA QUALITY (Run this first)
+# =============================================================================
+print("\n=== DATA QUALITY ASSESSMENT ===")
+
+# Check patients table
+patients_stats = conn.execute("""
+    SELECT 
+        COUNT(*) as total_patients,
+        COUNT(family_name) as has_name,
+        COUNT(gender) as has_gender,
+        COUNT(birth_date) as has_birth_date
+    FROM patients
+""").fetchone()
+
+print(f"Patients - Total: {patients_stats[0]}")
+print(f"  - With names: {patients_stats[1]} ({patients_stats[1]/patients_stats[0]*100:.1f}%)")
+print(f"  - With gender: {patients_stats[2]} ({patients_stats[2]/patients_stats[0]*100:.1f}%)")
+print(f"  - With birth date: {patients_stats[3]} ({patients_stats[3]/patients_stats[0]*100:.1f}%)")
+
+# Check observations table
+obs_stats = conn.execute("""
+    SELECT 
+        COUNT(*) as total_obs,
+        COUNT(code_display) as has_code,
+        COUNT(value_quantity_value) as has_value,
+        COUNT(subject_reference) as has_patient_ref
+    FROM observations
+""").fetchone()
+
+print(f"\nObservations - Total: {obs_stats[0]}")
+print(f"  - With code display: {obs_stats[1]} ({obs_stats[1]/obs_stats[0]*100:.1f}%)")
+print(f"  - With numeric values: {obs_stats[2]} ({obs_stats[2]/obs_stats[0]*100:.1f}%)")
+print(f"  - With patient refs: {obs_stats[3]} ({obs_stats[3]/obs_stats[0]*100:.1f}%)")
+
+# =============================================================================
+# 3. FIND DUPLICATES (Optional - run to check for duplicates)
+# =============================================================================
+print("\n=== CHECKING FOR DUPLICATES ===")
+
+# Check each table for duplicates
+tables = ['patients', 'observations', 'encounters', 'conditions', 'medication_requests', 'procedures']
+
+for table in tables:
+    try:
+        duplicates = conn.execute(f"""
+            SELECT COUNT(*) as duplicate_count
+            FROM (
+                SELECT id, COUNT(*) as count
+                FROM {table}
+                GROUP BY id
+                HAVING COUNT(*) > 1
+            )
+        """).fetchone()[0]
+        
+        if duplicates > 0:
+            print(f"{table}: {duplicates} duplicate IDs found")
+        else:
+            print(f"{table}: ✅ No duplicates")
+    except Exception as e:
+        print(f"{table}: ❌ Error - {e}")
+
+# =============================================================================
+# 4. CLEAN PATIENT DATA (Run this section)
+# =============================================================================
+print("\n=== CLEANING PATIENT DATA ===")
+
+# Get counts before cleaning
+before_count = conn.execute("SELECT COUNT(*) FROM patients").fetchone()[0]
+print(f"Patients before cleaning: {before_count}")
+
+# Clean family names - remove extra spaces and combine first and last name
+conn.execute("""
+    UPDATE patients
+    SET family_name = 
+        REGEXP_REPLACE(json_extract_string(name_full[1], '$.given[0]'), '[^A-Za-z]', '', 'g') || ' ' ||
+        REGEXP_REPLACE(json_extract_string(name_full[1], '$.family'), '[^A-Za-z]', '', 'g')
+    WHERE name_full IS NOT NULL
+      AND json_extract_string(name_full[1], '$.given[0]') IS NOT NULL
+      AND json_extract_string(name_full[1], '$.family') IS NOT NULL
+
+""")
+
+# Standardize gender values
+conn.execute("""
+    UPDATE patients 
+    SET gender = CASE 
+        WHEN LOWER(TRIM(gender)) IN ('m', 'male', 'man') THEN 'male'
+        WHEN LOWER(TRIM(gender)) IN ('f', 'female', 'woman') THEN 'female'
+        WHEN LOWER(TRIM(gender)) IN ('u', 'unknown', 'other') THEN 'unknown'
+        WHEN gender IS NULL OR TRIM(gender) = '' THEN 'unknown'
+        ELSE 'unknown'
+    END
+""")
+
+
+
+# =============================================================================
+# 5. CLEAN OBSERVATION DATA (Run this section)
+# =============================================================================
+print("\n=== CLEANING OBSERVATION DATA ===")
+
+# Get counts before cleaning
+obs_before = conn.execute("SELECT COUNT(*) FROM observations").fetchone()[0]
+print(f"Observations before cleaning: {obs_before}")
+
+# Remove observations without patient references
+deleted_no_patient = conn.execute("""
+    DELETE FROM observations 
+    WHERE subject_reference IS NULL OR TRIM(subject_reference) = ''
+""")
+print("✅ Removed observations without patient references")
+
+# Clean observation display names
+conn.execute("""
+    UPDATE observations 
+    SET code_display = TRIM(REGEXP_REPLACE(code_display, '\\s+', ' ', 'g'))
+    WHERE code_display IS NOT NULL
+""")
+print("✅ Cleaned observation display names")
+
+# =============================================================================
+# 6. STANDARDIZE REFERENCES (Run this section)
+# =============================================================================
+print("\n=== STANDARDIZING REFERENCES ===")
+
+# Clean patient references in observations (convert urn:uuid to Patient/)
+conn.execute("""
+    UPDATE observations 
+    SET subject_reference = REGEXP_REPLACE(subject_reference, '^urn:uuid:', 'Patient/', 'g')
+    WHERE subject_reference LIKE 'urn:uuid:%'
+""")
+
+# Clean patient references in conditions
+conn.execute("""
+    UPDATE conditions 
+    SET subject_reference = REGEXP_REPLACE(subject_reference, '^urn:uuid:', 'Patient/', 'g')
+    WHERE subject_reference LIKE 'urn:uuid:%'
+""")
+
+conn.execute("""
+    UPDATE medication_requests
+    SET subject_reference = REGEXP_REPLACE(subject_reference, '^urn:uuid:', 'Patient/', 'g')
+    WHERE subject_reference LIKE 'urn:uuid:%'
+""")
+
+conn.execute("""
+    UPDATE procedures
+    SET subject_reference = REGEXP_REPLACE(subject_reference, '^urn:uuid:', 'Patient/', 'g')
+    WHERE subject_reference LIKE 'urn:uuid:%'
+""")
+
+conn.execute("""
+    UPDATE encounters
+    SET subject_reference = REGEXP_REPLACE(subject_reference, '^urn:uuid:', 'Patient/', 'g')
+    WHERE subject_reference LIKE 'urn:uuid:%'
+""")
+
+
+# Clean encounter references
+conn.execute("""
+    UPDATE observations 
+    SET encounter_reference = REGEXP_REPLACE(encounter_reference, '^urn:uuid:', 'Encounter/', 'g')
+    WHERE encounter_reference LIKE 'urn:uuid:%'
+""")
+
+conn.execute("""
+    UPDATE medication_requests
+    SET encounter_reference = REGEXP_REPLACE(encounter_reference, '^urn:uuid:', 'Encounter/', 'g')
+    WHERE encounter_reference LIKE 'urn:uuid:%'
+""")
+
+conn.execute("""
+    UPDATE procedures
+    SET encounter_reference = REGEXP_REPLACE(encounter_reference, '^urn:uuid:', 'Encounter/', 'g')
+    WHERE encounter_reference LIKE 'urn:uuid:%'
+""")
+
+conn.execute("""
+    UPDATE conditions
+    SET encounter_reference = REGEXP_REPLACE(encounter_reference, '^urn:uuid:', 'Encounter/', 'g')
+    WHERE encounter_reference LIKE 'urn:uuid:%'
+""")
+
+print("✅ Patient references standardized")
+print("✅ Encounter references standardized")
+
+# =============================================================================
+# 7. CREATE CLEAN SUMMARY TABLES (Run this section)
+# =============================================================================
+print("\n=== CREATING SUMMARY TABLES ===")
+
+# Drop existing summary tables if they exist
+try:
+    conn.execute("DROP TABLE IF EXISTS patient_summary")
+    conn.execute("DROP TABLE IF EXISTS vital_signs_clean")
+except:
+    pass
+
+# Create clean patient summary with age calculations
+conn.execute("""
+    CREATE TABLE patient_summary AS
+    SELECT 
+        id,
+        family_name,
+        gender,
+        birth_date,
+        DATE_DIFF('year', CAST(birth_date AS DATE), CURRENT_DATE) as age,
+        CASE 
+            WHEN DATE_DIFF('year', CAST(birth_date AS DATE), CURRENT_DATE) < 18 THEN 'pediatric'
+            WHEN DATE_DIFF('year', CAST(birth_date AS DATE), CURRENT_DATE) >= 65 THEN 'geriatric'
+            ELSE 'adult'
+        END as age_group,
+        source_file
+    FROM patients
+    WHERE family_name IS NOT NULL 
+      AND gender IS NOT NULL 
+      AND birth_date IS NOT NULL
+""")
+
+# Create clean vital signs table
+conn.execute("""
+    CREATE TABLE vital_signs_clean AS
+    SELECT 
+        id,
+        subject_reference,
+        code_display,
+        value_quantity_value,
+        effective_datetime
+        value_quantity_unit,
+    FROM observations
+    WHERE code_display IN (
+        'Body Height', 'Body Weight', 'Body Mass Index', 
+        'Systolic Blood Pressure', 'Diastolic Blood Pressure',
+        'Heart Rate', 'Respiratory Rate', 'Body Temperature'
+    )
+    AND value_quantity_value IS NOT NULL
+    AND value_quantity_value > 0
+""")
+
+# Show summary counts
+patient_summary_count = conn.execute("SELECT COUNT(*) FROM patient_summary").fetchone()[0]
+vital_signs_count = conn.execute("SELECT COUNT(*) FROM vital_signs_clean").fetchone()[0]
+
+print(f"✅ Patient summary table: {patient_summary_count} clean records")
+print(f"✅ Vital signs table: {vital_signs_count} clean measurements")
+
+# =============================================================================
+# 8. FINAL VALIDATION (Run this to see results)
+# =============================================================================
+print("\n=== FINAL VALIDATION REPORT ===")
+
+# Get final statistics
+final_stats = conn.execute("""
+    SELECT 
+        COUNT(*) as total_patients,
+        COUNT(CASE WHEN family_name IS NOT NULL THEN 1 END) as with_names,
+        COUNT(CASE WHEN gender IN ('male', 'female', 'unknown') THEN 1 END) as with_valid_gender,
+        COUNT(CASE WHEN birth_date IS NOT NULL AND birth_date <= CURRENT_DATE THEN 1 END) as with_valid_birth_date
+    FROM patients
+""").fetchone()
+
+print(f"📊 FINAL PATIENT STATISTICS:")
+print(f"  Total patients: {final_stats[0]}")
+print(f"  With names: {final_stats[1]} ({final_stats[1]/final_stats[0]*100:.1f}%)")
+print(f"  With valid gender: {final_stats[2]} ({final_stats[2]/final_stats[0]*100:.1f}%)")
+print(f"  With valid birth date: {final_stats[3]} ({final_stats[3]/final_stats[0]*100:.1f}%)")
+
+# Final observation statistics
+final_obs_stats = conn.execute("""
+    SELECT 
+        COUNT(*) as total_obs,
+        COUNT(CASE WHEN subject_reference IS NOT NULL THEN 1 END) as with_patient_ref,
+        COUNT(CASE WHEN code_display IS NOT NULL THEN 1 END) as with_code,
+        COUNT(CASE WHEN value_quantity_value IS NOT NULL THEN 1 END) as with_value
+    FROM observations
+""").fetchone()
+
+print(f"\n📊 FINAL OBSERVATION STATISTICS:")
+print(f"  Total observations: {final_obs_stats[0]}")
+print(f"  With patient reference: {final_obs_stats[1]} ({final_obs_stats[1]/final_obs_stats[0]*100:.1f}%)")
+print(f"  With code display: {final_obs_stats[2]} ({final_obs_stats[2]/final_obs_stats[0]*100:.1f}%)")
+print(f"  With numeric value: {final_obs_stats[3]} ({final_obs_stats[3]/final_obs_stats[0]*100:.1f}%)")
+
+# =============================================================================
+# 9. SAMPLE CLEANED DATA (Run this to see examples)
+# =============================================================================
+print("\n=== SAMPLE CLEANED DATA ===")
+
+# Show sample patients
+print("🧑 SAMPLE PATIENTS:")
+sample_patients = conn.execute("""
+    SELECT family_name, gender, birth_date, age, age_group
+    FROM patient_summary 
+    ORDER BY age DESC
+    LIMIT 5
+""").fetchall()
+
+for i, patient in enumerate(sample_patients, 1):
+    print(f"  {i}. {patient[0]} | {patient[1]} | Born: {patient[2]} | Age: {patient[3]} | {patient[4]}")
+
+# Show sample vital signs
+print("\n💓 SAMPLE VITAL SIGNS:")
+sample_vitals = conn.execute("""
+    SELECT code_display, value_quantity_value, value_quantity_unit, COUNT(*) as frequency
+    FROM vital_signs_clean
+    GROUP BY code_display, value_quantity_value, value_quantity_unit
+    ORDER BY frequency DESC
+    LIMIT 5
+""").fetchall()
+
+for i, vital in enumerate(sample_vitals, 1):
+    print(f"  {i}. {vital[0]}: {vital[1]} {vital[2]} (appears {vital[3]} times)")
+
+# =============================================================================
+# QUICK ANALYSIS QUERIES (Run these for insights)
+# =============================================================================
+print("\n=== QUICK ANALYSIS ===")
+
+# Age distribution
+print("👥 AGE DISTRIBUTION:")
+age_dist = conn.execute("""
+    SELECT age_group, COUNT(*) as count
+    FROM patient_summary
+    GROUP BY age_group
+    ORDER BY count DESC
+""").fetchall()
+
+for group in age_dist:
+    print(f"  {group[0]}: {group[1]} patients")
+
+# Most common conditions
+print("\n🏥 TOP CONDITIONS:")
+top_conditions = conn.execute("""
+    SELECT code_display, COUNT(*) as frequency
+    FROM conditions
+    WHERE code_display IS NOT NULL
+    GROUP BY code_display
+    ORDER BY frequency DESC
+    LIMIT 5
+""").fetchall()
+
+for i, condition in enumerate(top_conditions, 1):
+    print(f"  {i}. {condition[0]}: {condition[1]} cases")
+
+# Most common observations
+print("\n🔬 TOP OBSERVATION TYPES:")
+top_observations = conn.execute("""
+    SELECT code_display, COUNT(*) as frequency
+    FROM observations
+    WHERE code_display IS NOT NULL
+    GROUP BY code_display
+    ORDER BY frequency DESC
+    LIMIT 5
+""").fetchall()
+
+for i, obs in enumerate(top_observations, 1):
+    print(f"  {i}. {obs[0]}: {obs[1]} measurements")
+
+print("\n" + "="*50)
+print("🎉 DATA CLEANING COMPLETED!")
+print("Your FHIR database is now clean and ready for analysis.")
+print("="*50)
+
+# Keep connection open for further analysis
+# conn.close()  # Uncomment this line when you're done
+
+# Begin Graphing
+df = conn.execute("SELECT * FROM patient_summary").df()
+
+fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+fig.suptitle('FHIR Patient Age and Gender Analysis', fontsize=16, fontweight='bold')
+
+# Plot 1: Age Histogram
+axes[0, 0].hist(df['age'], bins=20, color='skyblue', alpha=0.7, edgecolor='black')
+axes[0, 0].set_title('Age Distribution', fontweight='bold')
+axes[0, 0].set_xlabel('Age (years)')
+axes[0, 0].set_ylabel('Number of Patients')
+axes[0, 0].grid(True, alpha=0.3)
+
+# Add statistics to the plot
+mean_age = df['age'].mean()
+median_age = df['age'].median()
+axes[0, 0].axvline(mean_age, color='red', linestyle='--', label=f'Mean: {mean_age:.1f}')
+axes[0, 0].axvline(median_age, color='orange', linestyle='--', label=f'Median: {median_age:.1f}')
+axes[0, 0].legend()
+
+# Plot 2: Age Groups Bar Chart
+age_group_counts = df['age_group'].value_counts()
+axes[0, 1].bar(age_group_counts.index, age_group_counts.values, color=['lightcoral', 'lightblue', 'lightgreen'])
+axes[0, 1].set_title('Age Group Distribution', fontweight='bold')
+axes[0, 1].set_xlabel('Age Group')
+axes[0, 1].set_ylabel('Number of Patients')
+
+# Add count labels on bars
+for i, v in enumerate(age_group_counts.values):
+    axes[0, 1].text(i, v + 5, str(v), ha='center', fontweight='bold')
+
+# Plot 3: Gender Distribution Pie Chart
+gender_counts = df['gender'].value_counts()
+colors = ['lightpink', 'lightblue', 'lightgray']
+axes[1, 0].pie(gender_counts.values, labels=gender_counts.index, autopct='%1.1f%%', 
+               colors=colors, startangle=90)
+axes[1, 0].set_title('Gender Distribution', fontweight='bold')
+
+# Plot 4: Age by Gender Box Plot
+sns.boxplot(data=df, x='gender', y='age', ax=axes[1, 1])
+axes[1, 1].set_title('Age Distribution by Gender', fontweight='bold')
+axes[1, 1].set_xlabel('Gender')
+axes[1, 1].set_ylabel('Age (years)')
+
+plt.tight_layout()
+plt.show()
+
+# Set up and show encounter figure
+
+df_encounter = conn.execute("SELECT * FROM encounters").df()
+
+
+
+
+
+
+
+
+
+

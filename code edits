@@ -776,9 +776,226 @@ axes[1, 1].set_ylabel('Age (years)')
 plt.tight_layout()
 plt.show()
 
-# Set up and show encounter figure
+# Set up and show conditions figure
+df_conditions = conn.execute("SELECT * FROM conditions").df()
+fig, axes = plt.subplots(2,1,figsize=(22.5,22.5))
 
-df_encounter = conn.execute("SELECT * FROM encounters").df()
+# Plot 1: Bar Chart of Common Medical Conditions
+conditions_count = df_conditions['code_display'].value_counts()
+conditions_chart_top = conditions_count.head()
+axes[0].bar(conditions_chart_top.index, conditions_chart_top.values, color=['turquoise', 'teal', 'lightpink', 'blue', 'darkblue'], edgecolor = 'black', alpha=0.8)
+axes[0].set_xticklabels(conditions_chart_top.index, rotation=45, fontsize=10)
+axes[0].set_title('Most Common Conditions')
+axes[0].set_xlabel('Conditions')
+axes[0].set_ylabel('Frequency of Conditions')
+
+# Plot 2: Bar Chart of Age vs Common Conditions
+df_conditions_vs_age = conn.execute("""
+    SELECT 
+        p.age_group,
+        c.code_display as condition_name,
+        COUNT(*) as frequency
+    FROM patient_summary p
+    LEFT JOIN conditions c ON c.subject_reference LIKE '%' || p.id || '%'
+    WHERE p.age_group IS NOT NULL 
+        AND c.id IS NOT NULL      
+    GROUP BY p.age_group, c.code_display
+    ORDER BY p.age_group, frequency DESC
+    """).df()
+filtered_df_conditions_vs_age = df_conditions_vs_age.loc[df_conditions_vs_age.groupby('age_group')['frequency'].idxmax()].reset_index(drop=True)
+print(filtered_df_conditions_vs_age)
+bars = axes[1].bar(filtered_df_conditions_vs_age['age_group'], filtered_df_conditions_vs_age['frequency'], 
+                  color=['darkgrey', 'indigo', 'lightgrey'], alpha=0.8, 
+                  edgecolor='black', linewidth=1.2)
+for i, (bar, condition) in enumerate(zip(bars, filtered_df_conditions_vs_age['condition_name'])):
+        axes[1].text(bar.get_x() + bar.get_width()/2, bar.get_height() + 20,
+                condition, ha='center', va='bottom', 
+                fontweight='bold', fontsize=8)
+axes[1].set_title('Age Group vs Frequency of Most Common Condition')
+axes[1].set_xlabel('Age Group')
+axes[1].set_ylabel('Frequency (Number of Cases)')
+
+plt.tight_layout()
+plt.show()
+
+# Now showing the encounters
+encounter_query = """
+SELECT 
+    e.class as encounter_type,
+    COUNT(*) as frequency
+FROM encounters e
+WHERE e.class IS NOT NULL 
+    AND e.class != ''
+GROUP BY e.class
+ORDER BY frequency DESC
+"""
+
+df_encounters = conn.execute(encounter_query).df()
+fig, ax = plt.subplots(figsize=(12, 8))
+
+    
+ # Create bar chart
+bars = ax.bar(df_encounters['encounter_type'], df_encounters['frequency'], 
+color=['#3498DB', '#E74C3C', '#2ECC71', '#F39C12', '#9B59B6', 
+       '#1ABC9C', '#34495E', '#E67E22', '#95A5A6', '#F1C40F'][:len(df)],
+                  alpha=0.8, edgecolor='black', linewidth=1)
+    
+    # Add frequency values on top of bars
+for bar in bars:
+        height = bar.get_height()
+        ax.text(bar.get_x() + bar.get_width()/2., height + height*0.01,
+                f'{int(height):,}', ha='center', va='bottom', 
+                fontweight='bold', fontsize=10)
+    
+    # Customize the chart
+ax.set_title('Most Common Types of Healthcare Encounters\nFHIR Data Analysis', 
+                fontsize=16, fontweight='bold', pad=20)
+ax.set_xlabel('Encounter Type', fontsize=12, fontweight='bold')
+ax.set_ylabel('Number of Encounters', fontsize=12, fontweight='bold')
+    
+    # Rotate x-axis labels if they're long
+plt.xticks(rotation=45, ha='right')
+    
+    # Add grid for easier reading
+ax.grid(axis='y', alpha=0.3)
+ax.set_axisbelow(True)
+    
+ # Clean up the plot
+ax.spines['top'].set_visible(False)
+ax.spines['right'].set_visible(False)
+   
+plt.tight_layout()
+plt.show()
+
+# GRAPH 1: Most commonly prescribed medications
+most_common_meds_query = """
+SELECT 
+    m.medication_code,
+    m.medication_display as medication_name,
+    COUNT(*) as prescription_count,
+    COUNT(DISTINCT m.subject_reference) as unique_patients
+FROM medication_requests m
+WHERE m.medication_display IS NOT NULL 
+    AND m.medication_display != ''
+GROUP BY m.medication_code, m.medication_display
+ORDER BY prescription_count DESC
+LIMIT 20
+"""
+# Get data
+df_meds = conn.execute(most_common_meds_query).df()
+    
+# Create the graph
+fig, ax = plt.subplots(figsize=(14, 10))
+    
+# Take top 15 for better readability
+top_15 = df_meds.head(15)
+    
+# Create horizontal bar chart
+bars = ax.barh(range(len(top_15)), top_15['prescription_count'],
+                   color=plt.cm.viridis(np.linspace(0, 1, len(top_15))))
+    
+    # Customize y-axis with medication names (truncated for readability)
+ax.set_yticks(range(len(top_15)))
+med_names = [name[:47] + "..." if len(name) > 50 else name for name in top_15['medication_name']]
+ax.set_yticklabels(med_names, fontsize=11)
+    
+    # Add prescription counts and patient counts at the end of bars
+for i, (bar, prescriptions, patients) in enumerate(zip(bars, top_15['prescription_count'], top_15['unique_patients'])):
+    ax.text(bar.get_width() + bar.get_width()*0.01, bar.get_y() + bar.get_height()/2,
+                f'{prescriptions:,} prescriptions\n({patients:,} patients)', 
+                va='center', ha='left', fontsize=10, fontweight='bold')
+    
+    # Styling
+ax.set_title('Top 15 Most Commonly Prescribed Medications\nFHIR Healthcare Data Analysis', 
+                fontsize=16, fontweight='bold', pad=20)
+ax.set_xlabel('Number of Prescriptions', fontsize=12, fontweight='bold')
+ax.grid(axis='x', alpha=0.3)
+ax.set_axisbelow(True)
+    
+# Invert y-axis to show highest at top
+ax.invert_yaxis()
+    
+    # Add summary statistics
+total_prescriptions = top_15['prescription_count'].sum()
+total_unique_patients = top_15['unique_patients'].sum()
+    
+stats_text = f'Top 15 Summary:\n{total_prescriptions:,} total prescriptions\n{total_unique_patients:,} unique patients\nAvg: {top_15["prescription_count"].mean():.0f} prescriptions/medication'
+ax.text(0.98, 0.02, stats_text, transform=ax.transAxes, 
+            verticalalignment='bottom', horizontalalignment='right',
+            bbox=dict(boxstyle='round,pad=0.5', facecolor='lightblue', alpha=0.8),
+            fontsize=10)
+    
+plt.tight_layout()
+plt.show()
+    
+# Procedures graph
+# GRAPH 1: Most frequently performed procedures
+procedures_query = """
+SELECT 
+    p.code,
+    p.code_display as procedure_name,
+    COUNT(*) as procedure_count,
+    COUNT(DISTINCT p.subject_reference) as unique_patients
+FROM procedures p
+WHERE p.code_display IS NOT NULL 
+    AND p.code_display != ''
+GROUP BY p.code, p.code_display
+ORDER BY procedure_count DESC
+LIMIT 20
+"""
+  
+try:
+    df_procedures = conn.execute(procedures_query).df()
+    print(f"✓ Found {len(df_procedures)} different procedures")
+except Exception as e:
+    print(f"Error fetching procedures: {e}")
+    
+if len(df_procedures) == 0:
+    print("No procedure data found")
+    
+    # Create the graph
+fig, ax = plt.subplots(figsize=(14, 10))
+    
+    # Take top 15 for better readability
+top_15 = df_procedures.head(15)
+    
+    # Create horizontal bar chart
+colors = plt.cm.Set3(np.linspace(0, 1, len(top_15)))
+bars = ax.barh(range(len(top_15)), top_15['procedure_count'], color=colors, alpha=0.8)
+    
+    # Customize y-axis with procedure names (truncated for readability)
+ax.set_yticks(range(len(top_15)))
+procedure_names = [name[:60] + "..." if len(name) > 60 else name for name in top_15['procedure_name']]
+ax.set_yticklabels(procedure_names, fontsize=10)
+    
+    # Add procedure counts and patient counts at the end of bars
+for i, (bar, count, patients) in enumerate(zip(bars, top_15['procedure_count'], top_15['unique_patients'])):
+    ax.text(bar.get_width() + bar.get_width()*0.01, bar.get_y() + bar.get_height()/2,
+                f'{count:,}\n({patients:,} patients)', 
+                va='center', ha='left', fontsize=9, fontweight='bold')
+    
+    # Styling
+ax.set_title('Top 15 Most Frequently Performed Medical Procedures\nFHIR Healthcare Data Analysis', 
+                fontsize=16, fontweight='bold', pad=20)
+ax.set_xlabel('Number of Procedures Performed', fontsize=12, fontweight='bold')
+ax.grid(axis='x', alpha=0.3)
+ax.set_axisbelow(True)
+    
+    # Invert y-axis to show highest at top
+ax.invert_yaxis()
+    
+    # Add summary statistics
+total_procedures = top_15['procedure_count'].sum()
+total_patients = top_15['unique_patients'].sum()
+    
+stats_text = f'Top 15 Summary:\n{total_procedures:,} total procedures\n{total_patients:,} unique patients\nAvg: {top_15["procedure_count"].mean():.0f} procedures/type'
+ax.text(0.98, 0.02, stats_text, transform=ax.transAxes, 
+            verticalalignment='bottom', horizontalalignment='right',
+            bbox=dict(boxstyle='round,pad=0.5', facecolor='lightgreen', alpha=0.8),
+            fontsize=10)
+    
+plt.tight_layout()
+plt.show()
 
 
 
